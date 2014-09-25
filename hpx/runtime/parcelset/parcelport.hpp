@@ -14,6 +14,7 @@
 #include <hpx/runtime/naming/locality.hpp>
 #include <hpx/runtime/parcelset/parcel.hpp>
 #include <hpx/runtime/parcelset/server/parcelport_queue.hpp>
+#include <hpx/runtime/parcelset/detail/call_for_each.hpp>
 #include <hpx/performance_counters/parcels/data_point.hpp>
 #include <hpx/performance_counters/parcels/gatherer.hpp>
 #include <hpx/lcos/local/spinlock.hpp>
@@ -51,7 +52,7 @@ namespace hpx { namespace parcelset
 
     public:
         typedef HPX_STD_FUNCTION<
-            void(boost::system::error_code const&, parcel const&)
+            void(boost::system::error_code const&)
         > write_handler_type;
 
         typedef HPX_STD_FUNCTION<
@@ -364,7 +365,7 @@ namespace hpx { namespace parcelset
         server::parcelport_queue parcels_;
 
         /// The cache for pending parcels
-        typedef std::pair<std::vector<parcel>, std::vector<write_handler_type> >
+        typedef std::pair<std::vector<parcel>, detail::call_for_each>
             map_second_type;
         typedef std::map<naming::locality, map_second_type> pending_parcels_map;
         pending_parcels_map pending_parcels_;

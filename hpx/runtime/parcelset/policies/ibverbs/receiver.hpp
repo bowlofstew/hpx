@@ -35,7 +35,10 @@ namespace hpx { namespace parcelset { namespace policies { namespace ibverbs
     class receiver
       : public parcelport_connection<
             receiver
+        /*
           , std::vector<char, allocator<message::payload_size> >
+        */
+          , std::vector<char>
           , std::vector<char>
         >
     {
@@ -57,6 +60,7 @@ namespace hpx { namespace parcelset { namespace policies { namespace ibverbs
         /// Get the data window associated with the parcelport_connection.
         server_context& context() { return context_; }
 
+        /*
         boost::shared_ptr<parcel_buffer_type> get_buffer(parcel const & p = parcel(), std::size_t arg_size = 0)
         {
             if(!buffer_ || (buffer_ && !buffer_->parcels_decoded_))
@@ -72,6 +76,7 @@ namespace hpx { namespace parcelset { namespace policies { namespace ibverbs
             }
             return buffer_;
         }
+        */
 
         /// Asynchronously read a data structure from the socket.
         void async_read(boost::system::error_code & ec)

@@ -20,7 +20,7 @@ namespace hpx { namespace parcelset {
 
     boost::uint64_t get_max_inbound_size(parcelport&);
 
-    template <typename Connection, typename BufferType, typename ChunkType = util::serialization_chunk>
+    template <typename Connection, typename ConnectionHandler>
     struct parcelport_connection
       : boost::enable_shared_from_this<Connection>
       , private boost::noncopyable
@@ -40,10 +40,17 @@ namespace hpx { namespace parcelset {
             state_deleting
         };
 #endif
+        ConnectionHandler & parcelport_;
+        /// the other (receiving) end of this connection
+        naming::locality there_;
+        boost::atomic<bool> handling_messages_;
 
 #if defined(HPX_HAVE_SECURITY) && defined(HPX_TRACK_STATE_OF_OUTGOING_TCP_CONNECTION)
-        parcelport_connection()
-          : first_message_(true)
+        parcelport_connection(ConnectionHandler & parcelport, naming::locality there = naming::locality())
+          : parcelport_(parcelport)
+          , there_(there)
+          , handling_messages_(false)
+          , first_message_(true)
           , state_(state_initialized)
         {}
         bool first_message_;
@@ -51,44 +58,91 @@ namespace hpx { namespace parcelset {
 #endif
 
 #if defined(HPX_HAVE_SECURITY) && !defined(HPX_TRACK_STATE_OF_OUTGOING_TCP_CONNECTION)
-        parcelport_connection()
-          : first_message_(true)
+        parcelport_connection(ConnectionHandler & parcelport, naming::locality there = naming::locality())
+          : parcelport_(parcelport)
+          , there_(there)
+          , handling_messages_(false)
+          , first_message_(true)
         {}
         bool first_message_;
 #endif
 
 #if !defined(HPX_HAVE_SECURITY) && defined(HPX_TRACK_STATE_OF_OUTGOING_TCP_CONNECTION)
-        parcelport_connection()
-          : state_(state_initialized)
+        parcelport_connection(ConnectionHandler & parcelport, naming::locality there = naming::locality())
+          : parcelport_(parcelport)
+          , there_(there)
+          , handling_messages_(false)
+          , state_(state_initialized)
         {}
         state state_;
 #endif
 
-#if defined(HPX_TRACK_STATE_OF_OUTGOING_TCP_CONNECTION)
-        void set_state(state newstate)
-        {
-            state_ = newstate;
-        }
+#if !defined(HPX_HAVE_SECURITY) && !defined(HPX_TRACK_STATE_OF_OUTGOING_TCP_CONNECTION)
+        parcelport_connection(ConnectionHandler & parcelport, naming::locality there = naming::locality())
+          : parcelport_(parcelport)
+          , there_(there)
+          , handling_messages_(false)
+        {}
 #endif
 
         virtual ~parcelport_connection() {}
 
         ////////////////////////////////////////////////////////////////////////
-        typedef BufferType buffer_type;
-        typedef parcel_buffer<buffer_type, ChunkType> parcel_buffer_type;
-
-        virtual boost::shared_ptr<parcel_buffer_type> get_buffer(parcel const & p = parcel(), std::size_t arg_size = 0)
-        {
-            if(!buffer_ || (buffer_ && !buffer_->parcels_decoded_))
-            {
-                buffer_ = boost::make_shared<parcel_buffer_type>();
-                buffer_->data_.reserve(arg_size);
-            }
-            return buffer_;
-        }
+        typedef typename ConnectionHandler::template get_parcel_buffer_type<Connection>::type parcel_buffer_type;
 
         /// buffer for data
         boost::shared_ptr<parcel_buffer_type> buffer_;
+
+        template <typename ParcelPostprocess>
+        void done(
+            ParcelPostprocess pp
+          , boost::system::error_code const& ec
+          , naming::locality const& locality_id
+          , boost::shared_ptr<Connection> sender_connection
+        )
+        {
+            HPX_ASSERT(sender_connection.get() == this);
+            HPX_ASSERT(handling_messages_);
+            handling_messages_ = false;
+            pp(ec, locality_id, sender_connection);
+        }
+
+        template <typename Handler, typename ParcelPostprocess>
+        bool write(boost::shared_ptr<parcel_buffer_type> buffer, Handler handler, ParcelPostprocess parcel_postprocess)
+        {
+            HPX_ASSERT(there_);
+            // Atomically set handling_messages_ to true, if another work item hasn't
+            // started executing before us.
+            bool false_ = false;
+            if (!handling_messages_.compare_exchange_strong(false_, true))
+            {
+                return false;
+            }
+
+            HPX_ASSERT(handling_messages_);
+            buffer_ = buffer;
+
+            void (parcelport_connection::*f)(
+                ParcelPostprocess
+              , boost::system::error_code const&
+              , naming::locality const&
+              , boost::shared_ptr<Connection>) = &parcelport_connection::done<ParcelPostprocess>;
+            static_cast<Connection &>(*this).async_write(
+                handler
+              , util::bind(
+                    f
+                  , this
+                  , util::protect(std::move(parcel_postprocess))
+                  , util::placeholders::_1, util::placeholders::_2, util::placeholders::_3
+                )
+            );
+            return true;
+        }
+
+        bool busy()
+        {
+            return handling_messages_;
+        }
     };
 }}
 

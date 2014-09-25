@@ -490,6 +490,7 @@ namespace hpx { namespace parcelset { namespace policies { namespace ibverbs
         while(!stopped_)
         {
             hpx::util::high_resolution_timer t;
+            /*
             boost::shared_ptr<receiver> rcv = acceptor_.accept(*this, memory_pool_, boost::system::throws);
             if(rcv)
             {
@@ -500,6 +501,7 @@ namespace hpx { namespace parcelset { namespace policies { namespace ibverbs
                 }
             }
             time_acct += t.elapsed();
+            */
 
             hpx::lcos::local::spinlock::yield(k);
         }

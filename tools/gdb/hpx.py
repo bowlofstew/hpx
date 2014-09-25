@@ -91,7 +91,8 @@ class Unordered(object):
         def _value(self):
             assert self.node
             node = self.node.dereference().cast(self.node_type)
-            return node['value_base_']['data_'].cast(self.value_type)
+            #return node['value_base_']['data_'].cast(self.value_type)
+            return node['data_'].cast(self.value_type)
 
 class Map(Unordered):
 
@@ -196,13 +197,13 @@ class HPXThread():
 
     tagged_state_type = current_state.type.template_argument(0)
     state_enum_type = tagged_state_type.template_argument(0)
-    self.state = current_state['m_storage'] >> 24
+    self.state = current_state['v_'] >> 24
     self.state = self.state.cast(state_enum_type)
 
     current_state_ex = self.thread_data['current_state_ex_']
     tagged_state_ex_type = current_state_ex.type.template_argument(0)
     state_ex_enum_type = tagged_state_ex_type.template_argument(0)
-    self.state_ex = current_state_ex['m_storage'] >> 24
+    self.state_ex = current_state_ex['v_'] >> 24
     self.state_ex = self.state_ex.cast(state_ex_enum_type)
 
     self.size_t = gdb.lookup_type("std::size_t")

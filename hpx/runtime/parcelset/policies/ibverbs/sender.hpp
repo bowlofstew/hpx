@@ -30,7 +30,9 @@ namespace hpx { namespace parcelset { namespace policies { namespace ibverbs
     class sender
       : public parcelset::parcelport_connection<
             sender
-          , std::vector<char, allocator<message::payload_size> >
+          //, std::vector<char, allocator<message::payload_size> >
+          , std::vector<char>
+          , std::vector<char>
         >//data_buffer>
     {
         typedef bool(sender::*next_function_type)();
@@ -75,6 +77,7 @@ namespace hpx { namespace parcelset { namespace policies { namespace ibverbs
             return there_;
         }
 
+        /*
         boost::shared_ptr<parcel_buffer_type> get_buffer(parcel const & p, std::size_t arg_size)
         {
             if(!buffer_)
@@ -90,6 +93,7 @@ namespace hpx { namespace parcelset { namespace policies { namespace ibverbs
             }
             return buffer_;
         }
+        */
 
         /// Asynchronously write a data structure to the socket.
         template <typename Handler, typename ParcelPostprocess>

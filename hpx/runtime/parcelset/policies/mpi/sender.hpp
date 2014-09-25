@@ -24,9 +24,12 @@ namespace hpx { namespace parcelset { namespace policies { namespace mpi
     void close_sender_connection(connection_handler & handler, int tag, int rank);
 
     class sender
-      : public parcelset::parcelport_connection<sender, std::vector<char> >
+      : public parcelset::parcelport_connection<sender, connection_handler>
     {
     public:
+
+        typedef parcelport_connection<sender, connection_handler> base_type;
+
         typedef
             HPX_STD_FUNCTION<void(boost::system::error_code const &, std::size_t)>
             handler_function_type;
@@ -46,15 +49,15 @@ namespace hpx { namespace parcelset { namespace policies { namespace mpi
         sender(MPI_Comm communicator,
             int tag,
             naming::locality const& locality_id,
-            connection_handler & handler,
+            connection_handler & parcelport,
             performance_counters::parcels::gatherer& parcels_sent)
-          : communicator_(communicator)
+          : base_type(parcelport, locality_id)
+          , communicator_(communicator)
           , tag_(tag)
           , receiver_tag_(-1)
           , sent_chunks_(0)
           , next_(0)
-          , parcelport_(handler)
-          , there_(locality_id), parcels_sent_(parcels_sent)
+          , parcels_sent_(parcels_sent)
         {}
 
         ~sender()
@@ -121,7 +124,14 @@ namespace hpx { namespace parcelset { namespace policies { namespace mpi
                     sent_chunks_ = 0;
                     postprocess_function_type pp;
                     std::swap(pp, postprocess_);
+                    HPX_ASSERT(!buffer_);
                     pp(ec, there_, shared_from_this());
+                    if(buffer_)
+                    {
+                        //std::cout << "We got more!\n";
+                        return false;
+                    }
+                    //std::cout << there_ << " sending done ...\n";
                     return true;
 
                 }
@@ -191,7 +201,7 @@ namespace hpx { namespace parcelset { namespace policies { namespace mpi
         {
             verify_valid();
 
-            std::vector<parcel_buffer<buffer_type>::transmission_chunk_type>& chunks =
+            std::vector<parcel_buffer_type::transmission_chunk_type>& chunks =
                 buffer_->transmission_chunks_;
             if(chunks.empty())
             {
@@ -202,7 +212,7 @@ namespace hpx { namespace parcelset { namespace policies { namespace mpi
                 chunks.data(), // Data pointer
                 static_cast<int>(
                     chunks.size()
-                        * sizeof(parcel_buffer<buffer_type>::transmission_chunk_type)
+                        * sizeof(parcel_buffer_type::transmission_chunk_type)
                     ), // Size
                 MPI_CHAR,               // MPI Datatype
                 header_.rank(),         // Destination
@@ -344,11 +354,6 @@ namespace hpx { namespace parcelset { namespace policies { namespace mpi
         MPI_Request request_;
         handler_function_type handler_;
         postprocess_function_type postprocess_;
-
-        connection_handler & parcelport_;
-
-        /// the other (receiving) end of this connection
-        naming::locality there_;
 
         /// Counters and their data containers.
         util::high_resolution_timer timer_;

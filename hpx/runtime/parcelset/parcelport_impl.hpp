@@ -12,8 +12,11 @@
 
 #include <hpx/runtime/parcelset/parcelport.hpp>
 #include <hpx/runtime/parcelset/encode_parcels.hpp>
+#include <hpx/runtime/parcelset/connections.hpp>
+#include <hpx/runtime/parcelset/allocator.hpp>
 #include <hpx/runtime/parcelset/detail/call_for_each.hpp>
 #include <hpx/runtime/threads/thread.hpp>
+#include <hpx/state.hpp>
 #include <hpx/util/io_service_pool.hpp>
 #include <hpx/util/connection_cache.hpp>
 #include <hpx/util/runtime_configuration.hpp>
@@ -39,6 +42,40 @@ namespace hpx { namespace parcelset
             typename connection_handler_traits<ConnectionHandler>::connection_type
             connection;
     public:
+
+        template <typename Trait>
+        struct get_buffer_type
+        {
+            typedef typename Trait::buffer_type type;
+        };
+
+        typedef
+            typename boost::mpl::eval_if<
+                typename connection_handler_traits<ConnectionHandler>::provides_get_buffer
+              , get_buffer_type<connection_handler_traits<ConnectionHandler> >
+              , boost::mpl::identity<std::vector<char, allocator> >
+            >::type
+            buffer_type;
+        typedef
+            parcel_buffer<buffer_type, util::serialization_chunk>
+            sender_parcel_buffer_type;
+
+        typedef
+            parcel_buffer<buffer_type, std::vector<char> >
+            receiver_parcel_buffer_type;
+
+        template <typename Connection>
+        struct get_parcel_buffer_type
+        {
+            typedef typename
+                boost::mpl::if_<
+                    typename boost::is_same<Connection, connection>::type
+                  , sender_parcel_buffer_type
+                  , receiver_parcel_buffer_type
+                >::type
+                type;
+        };
+
         static const char * connection_handler_name()
         {
             return connection_handler_traits<ConnectionHandler>::name();
@@ -86,6 +123,20 @@ namespace hpx { namespace parcelset
             return boost::lexical_cast<std::size_t>(max_connections_per_locality);
         }
 
+        static std::size_t memory_chunk_size(util::runtime_configuration const& ini)
+        {
+            std::string memory_chunk_size =
+                ini.get_entry("hpx.parcel.memory_chunk_size", "2048");
+            return boost::lexical_cast<std::size_t>(memory_chunk_size);
+        }
+
+        static std::size_t max_memory_chunks(util::runtime_configuration const& ini)
+        {
+            std::string max_memory_chunks =
+                ini.get_entry("hpx.parcel.max_memory_chunks", "512");
+            return boost::lexical_cast<std::size_t>(max_memory_chunks);
+        }
+
     public:
         /// Construct the parcelport on the given locality.
         parcelport_impl(util::runtime_configuration const& ini,
@@ -94,8 +145,10 @@ namespace hpx { namespace parcelset
           : parcelport(ini, connection_handler_name())
           , io_service_pool_(thread_pool_size(ini),
                 on_start_thread, on_stop_thread, pool_name(), pool_name_postfix())
-          , connection_cache_(max_connections(ini), max_connections_per_loc(ini))
+          //, connection_cache_(max_connections(ini), max_connections_per_loc(ini))
+          , connections_(max_connections_per_loc(ini))
           , archive_flags_(boost::archive::no_header)
+          , memory_pool_(memory_chunk_size(ini), max_memory_chunks(ini))
         {
 #ifdef BOOST_BIG_ENDIAN
             std::string endian_out = get_config_entry("hpx.parcel.endian_out", "big");
@@ -118,11 +171,16 @@ namespace hpx { namespace parcelset
                 if (!this->allow_zero_copy_optimizations())
                     archive_flags_ |= util::disable_data_chunking;
             }
+
+            std::string num_encode_threads = get_config_entry("hpx.parcel.num_encode_threads", "4");
+            num_encode_threads_ = boost::lexical_cast<std::size_t>(num_encode_threads);
+            encode_threads_.reserve(num_encode_threads_);
         }
 
         ~parcelport_impl()
         {
-            connection_cache_.clear();
+            //connection_cache_.clear();
+            connections_.clear();
         }
 
         bool run(bool blocking = true)
@@ -142,10 +200,11 @@ namespace hpx { namespace parcelset
             // make sure no more work is pending, wait for service pool to get empty
             io_service_pool_.stop();
             if (blocking) {
-                connection_cache_.shutdown();
+                //connection_cache_.shutdown();
                 connection_handler().do_stop();
                 io_service_pool_.join();
-                connection_cache_.clear();
+                //connection_cache_.clear();
+                connections_.clear();
                 io_service_pool_.clear();
             }
         }
@@ -157,17 +216,8 @@ namespace hpx { namespace parcelset
             // enqueue the outgoing parcel ...
             enqueue_parcel(locality_id, std::move(p), std::move(f));
 
-            if (enable_parcel_handling_)
-            {
-                if (hpx::is_running() && async_serialization())
-                {
-                    trigger_sending_parcels(locality_id);
-                }
-                else
-                {
-                    get_connection_and_send_parcels(locality_id);
-                }
-            }
+            // start actual parcel encoding
+            schedule_parcel_encoding();
         }
 
         void put_parcels(std::vector<parcel> parcels,
@@ -183,6 +233,7 @@ namespace hpx { namespace parcelset
             naming::locality const& locality_id =
                 parcels[0].get_destination_locality();
 
+
 #if defined(HPX_DEBUG)
             // make sure all parcels go to the same locality
             for (std::size_t i = 1; i != parcels.size(); ++i)
@@ -195,17 +246,8 @@ namespace hpx { namespace parcelset
             HPX_ASSERT(parcels.size() == handlers.size());
             enqueue_parcels(locality_id, std::move(parcels), std::move(handlers));
 
-            if (enable_parcel_handling_)
-            {
-                if (hpx::is_running() && async_serialization())
-                {
-                    trigger_sending_parcels(locality_id);
-                }
-                else
-                {
-                    get_connection_and_send_parcels(locality_id);
-                }
-            }
+            // start actual parcel encoding
+            schedule_parcel_encoding();
         }
 
         void send_early_parcel(parcel& p)
@@ -223,7 +265,8 @@ namespace hpx { namespace parcelset
         void do_background_work()
         {
             do_background_work_impl<ConnectionHandler>();
-            trigger_pending_work();
+            //schedule_parcel_encoding();
+            trigger_writes();
         }
 
         /// support enable_shared_from_this
@@ -247,7 +290,8 @@ namespace hpx { namespace parcelset
         /// Cache specific functionality
         void remove_from_connection_cache(naming::locality const& loc)
         {
-            connection_cache_.clear(loc);
+            //connection_cache_.clear(loc);
+            connections_.clear(loc);
         }
 
         /// Temporarily enable/disable all parcel handling activities in the
@@ -257,7 +301,19 @@ namespace hpx { namespace parcelset
             enable_parcel_handling_ = new_state;
             do_enable_parcel_handling_impl<ConnectionHandler>(new_state);
             if (new_state)
-                trigger_pending_work();
+                do_background_work();
+        }
+
+        boost::shared_ptr<sender_parcel_buffer_type>
+        get_sender_buffer(parcel const & p = parcel(), std::size_t arg_size = 0)
+        {
+            return get_sender_buffer_impl<ConnectionHandler>(p, arg_size);
+        }
+
+        boost::shared_ptr<receiver_parcel_buffer_type>
+        get_receiver_buffer(parcel const & p = parcel(), std::size_t arg_size = 0)
+        {
+            return get_receiver_buffer_impl<ConnectionHandler>(p, arg_size);
         }
 
         /////////////////////////////////////////////////////////////////////////
@@ -266,6 +322,7 @@ namespace hpx { namespace parcelset
             connection_cache_statistics_type t, bool reset)
         {
             switch (t) {
+            /*
                 case connection_cache_insertions:
                     return connection_cache_.get_cache_insertions(reset);
 
@@ -281,14 +338,89 @@ namespace hpx { namespace parcelset
                 case connection_cache_reclaims:
                     return connection_cache_.get_cache_reclaims(reset);
 
+            */
+                case connection_cache_insertions:
+                    return connections_.insertions_;
+
+                case connection_cache_hits:
+                    return connections_.hits_;
+
+                case connection_cache_misses:
+                    return connections_.misses_;
+
+                case connection_cache_reclaims:
+                    return connections_.reclaims_;
                 default:
                     break;
             }
 
+            /*
             HPX_THROW_EXCEPTION(bad_parameter,
                 "parcelport_impl::get_connection_cache_statistics",
                 "invalid connection cache statistics type");
+            */
             return 0;
+        }
+
+        bool dequeue_out_buffers(
+            naming::locality const & locality
+          , boost::shared_ptr<sender_parcel_buffer_type> & buffer
+          , detail::call_for_each & handlers
+        )
+        {
+            typedef typename out_buffer_map_type::iterator iterator;
+            if(!enable_parcel_handling_)
+                return false;
+
+            {
+                lcos::local::spinlock::scoped_lock l(out_buffer_mtx_);
+                iterator it = out_buffer_map_.find(locality);
+
+                // do nothing if out buffers have already been picked up
+                // by another thread.
+                if(it == out_buffer_map_.end())
+                {
+                    return false;
+                }
+                HPX_ASSERT(!it->second.empty());
+
+                HPX_ASSERT(it->first == locality);
+                HPX_ASSERT(!buffer);
+                HPX_ASSERT(handlers.fv_.empty());
+
+                typename out_buffer_type::value_type & out_buffer = it->second.back();
+                buffer = out_buffer.first;
+                std::swap(handlers, out_buffer.second);
+                it->second.pop_back();
+                if(it->second.empty())
+                {
+                    out_buffer_map_.erase(it);
+                    parcel_destinations_.erase(locality);
+                }
+
+                return true;
+            }
+        }
+
+        void enqueue_out_buffers(
+            naming::locality const & locality
+          , boost::shared_ptr<sender_parcel_buffer_type> buffer
+          , detail::call_for_each handlers
+        )
+        {
+            lcos::local::spinlock::scoped_lock l(out_buffer_mtx_);
+
+            typedef typename out_buffer_map_type::mapped_type mapped_type;
+
+            mapped_type & out_buffers = out_buffer_map_[locality];
+            out_buffers.push_back(
+                std::make_pair(
+                    buffer
+                  , std::move(handlers)
+                )
+            );
+
+            parcel_destinations_.insert(locality);
         }
 
     private:
@@ -396,32 +528,58 @@ namespace hpx { namespace parcelset
         {
         }
 
-        ///////////////////////////////////////////////////////////////////////
-        boost::shared_ptr<connection> get_connection(
-            naming::locality const& l, bool force, error_code& ec)
+        template <typename ConnectionHandler_>
+        typename boost::enable_if<
+            typename connection_handler_traits<
+                ConnectionHandler_
+            >::provides_get_buffer
+          , boost::shared_ptr<sender_parcel_buffer_type>
+        >::type
+        get_sender_buffer_impl(parcel const & p = parcel(), std::size_t arg_size = 0)
         {
-            // Request new connection from connection cache.
-            boost::shared_ptr<connection> sender_connection;
+            return connection_handler().get_sender_buffer(p, arg_size);
+        }
 
-            // Get a connection or reserve space for a new connection.
-            if (!connection_cache_.get_or_reserve(l, sender_connection, force))
-            {
-                // If no slot is available it's not a problem as the parcel
-                // will be sent out whenever the next connection is returned
-                // to the cache.
-                if (&ec != &throws)
-                    ec = make_success_code();
-                return sender_connection;
-            }
+        template <typename ConnectionHandler_>
+        typename boost::disable_if<
+            typename connection_handler_traits<
+                ConnectionHandler_
+            >::provides_get_buffer
+          , boost::shared_ptr<sender_parcel_buffer_type>
+        >::type
+        get_sender_buffer_impl(parcel const & p = parcel(), std::size_t arg_size = 0)
+        {
+            boost::shared_ptr<sender_parcel_buffer_type> buffer;
+            buffer = boost::make_shared<sender_parcel_buffer_type>(allocator(memory_pool_));
+            buffer->data_.reserve(arg_size);
+            return buffer;
+        }
 
-            // Check if we need to create the new connection.
-            if (!sender_connection)
-                return connection_handler().create_connection(l, ec);
+        template <typename ConnectionHandler_>
+        typename boost::enable_if<
+            typename connection_handler_traits<
+                ConnectionHandler_
+            >::provides_get_buffer
+          , boost::shared_ptr<receiver_parcel_buffer_type>
+        >::type
+        get_receiver_buffer_impl(parcel const & p = parcel(), std::size_t arg_size = 0)
+        {
+            return connection_handler().get_receiver_buffer(p, arg_size);
+        }
 
-            if (&ec != &throws)
-                ec = make_success_code();
-
-            return sender_connection;
+        template <typename ConnectionHandler_>
+        typename boost::disable_if<
+            typename connection_handler_traits<
+                ConnectionHandler_
+            >::provides_get_buffer
+          , boost::shared_ptr<receiver_parcel_buffer_type>
+        >::type
+        get_receiver_buffer_impl(parcel const & p = parcel(), std::size_t arg_size = 0)
+        {
+            boost::shared_ptr<receiver_parcel_buffer_type> buffer;
+            buffer = boost::make_shared<receiver_parcel_buffer_type>(allocator(memory_pool_));
+            buffer->data_.reserve(arg_size);
+            return buffer;
         }
 
         ///////////////////////////////////////////////////////////////////////
@@ -434,9 +592,7 @@ namespace hpx { namespace parcelset
 
             mapped_type& e = pending_parcels_[locality_id];
             e.first.push_back(std::move(p));
-            e.second.push_back(std::move(f));
-
-            parcel_destinations_.insert(locality_id);
+            e.second.fv_.push_back(detail::call_for_each(std::move(f)));
         }
 
         void enqueue_parcels(naming::locality const& locality_id,
@@ -452,271 +608,311 @@ namespace hpx { namespace parcelset
             mapped_type& e = pending_parcels_[locality_id];
             if (e.first.empty())
             {
-                HPX_ASSERT(e.second.empty());
+                HPX_ASSERT(e.second.fv_.empty());
 #if HPX_GCC_VERSION >= 40600 && HPX_GCC_VERSION < 40700
                 // GCC4.6 gets incredibly confused
                 std::swap(e.first, static_cast<std::vector<parcel>&>(parcels));
-                std::swap(e.second, static_cast<std::vector<write_handler_type>&>(handlers));
 #else
                 std::swap(e.first, parcels);
-                std::swap(e.second, handlers);
 #endif
+                e.second = detail::call_for_each(std::move(handlers));
             }
             else
             {
-                HPX_ASSERT(e.first.size() == e.second.size());
+                HPX_ASSERT(e.first.size() == e.second.fv_.size());
                 std::size_t new_size = e.first.size() + parcels.size();
                 e.first.reserve(new_size);
-                e.second.reserve(new_size);
+                e.second.fv_.reserve(new_size);
 
                 std::move(parcels.begin(), parcels.end(),
                     std::back_inserter(e.first));
                 std::move(handlers.begin(), handlers.end(),
-                    std::back_inserter(e.second));
+                    std::back_inserter(e.second.fv_));
             }
-
-            parcel_destinations_.insert(locality_id);
         }
 
-        bool dequeue_parcels(naming::locality const& locality_id,
+        void schedule_parcel_encoding()
+        {
+            if(!enable_parcel_handling_) return;
+
+            // Are we allowed to launch new threads?
+            if(hpx::is_running() && async_serialization())
+            {
+                lcos::local::spinlock::scoped_lock l(encode_threads_mtx_);
+
+                // Check if we can start another thread
+                if(encode_threads_.size() > num_encode_threads_)
+                {
+                    // The number of active threads exceeds the maximum ...
+                    // We need to schedule another encode thread, if all are
+                    // suspended. This is a counter measurement to #1217
+                    std::size_t num_suspended = 0;
+                    BOOST_FOREACH(threads::thread_id_type & id, encode_threads_)
+                    {
+                        if(threads::get_thread_state(id) == threads::suspended)
+                            ++num_suspended;
+                    }
+
+                    // If at least one is running, we don't need to schedule
+                    // a new one.
+                    if(num_suspended < encode_threads_.size())
+                        return;
+                }
+
+                error_code ec(lightweight);
+                std::size_t thread_num = get_worker_thread_num();
+                threads::thread_id_type encode_thread = applier::register_thread_nullary(
+                    util::bind(
+                        &parcelport_impl::encode_parcels_impl
+                      , this
+                    )
+                  , "encode_parcels"
+                  , threads::pending
+                  , true
+                  , threads::thread_priority_boost
+                  , thread_num
+                  , threads::thread_stacksize_default
+                  , ec
+                );
+                if(ec)
+                {
+                    // FIXME: throw exception on error ...
+                }
+                else
+                {
+                    encode_threads_.push_back(encode_thread);
+                }
+
+                return;
+            }
+
+            if(threads::get_self_ptr() != 0)
+            {
+                lcos::local::spinlock::scoped_lock l(encode_threads_mtx_);
+                encode_threads_.push_back(threads::get_self_id());
+            }
+            //std::cout << "non async parcel encoding ...\n";
+            encode_parcels_impl();
+        }
+
+        struct encoding_parcels
+        {
+            encoding_parcels(
+                hpx::lcos::local::spinlock & mtx
+              , std::vector<threads::thread_id_type> & encode_threads)
+              : mtx_(mtx)
+              , thread_id_(threads::get_self_id())
+              , encode_threads_(encode_threads)
+            {
+#if defined(HPX_DEBUG)
+                if(threads::get_self_ptr() == 0) return;
+                hpx::lcos::local::spinlock::scoped_lock l(mtx_);
+                HPX_ASSERT(encode_threads_.size() > 0);
+#endif
+            }
+
+            ~encoding_parcels()
+            {
+                if(threads::get_self_ptr() == 0) return;
+                hpx::lcos::local::spinlock::scoped_lock l(mtx_);
+                HPX_ASSERT(encode_threads_.size() > 0);
+
+                std::vector<threads::thread_id_type>::iterator it;
+                it = std::find(encode_threads_.begin(), encode_threads_.end(), thread_id_);
+                HPX_ASSERT(it != encode_threads_.end());
+                encode_threads_.erase(it);
+            }
+
+            hpx::lcos::local::spinlock & mtx_;
+            threads::thread_id_type thread_id_;
+            std::vector<threads::thread_id_type> & encode_threads_;
+        };
+
+        void encode_parcels_impl()
+        {
+            // reschedule ourself as HPX thread if we are not already running in
+            // a HPX thread
+            if(threads::get_self_ptr() == 0 && !hpx::is_starting())
+            {
+                error_code ec(lightweight);
+                threads::thread_id_type encode_thread = applier::register_thread_nullary(
+                    util::bind(
+                        &parcelport_impl::encode_parcels_impl
+                      , this
+                    )
+                  , "encode_parcels"
+                  , threads::pending
+                  , true
+                  , threads::thread_priority_boost
+                  , std::size_t(-1)
+                  , threads::thread_stacksize_default
+                  , ec
+                );
+                if(ec)
+                {
+                    // FIXME: throw exception on error ...
+                }
+                else
+                {
+                    lcos::local::spinlock::scoped_lock l(encode_threads_mtx_);
+                    encode_threads_.push_back(encode_thread);
+                }
+                return;
+            }
+
+            encoding_parcels ep(
+                encode_threads_mtx_
+              , encode_threads_);
+
+            naming::locality locality;
+            std::vector<parcel> parcels;
+            detail::call_for_each handlers;
+            bool has_work = true;
+            hpx::util::high_resolution_timer t;
+            std::size_t k = 0;
+            while(has_work || (!has_work && t.elapsed() < 2.0))
+            {
+                {
+                    lcos::local::spinlock::scoped_lock l(mtx_);
+                    pending_parcels_map::iterator it = pending_parcels_.begin();
+
+                    while(it != pending_parcels_.end())
+                    {
+                        locality = it->first;
+                        if(dequeue_parcels(it, parcels, handlers))
+                        {
+                            has_work = true;
+                            t.restart();
+                            break;
+                        }
+                        ++it;
+                    }
+                }
+                if(parcels.empty())
+                {
+                    break;
+                    /*
+                    has_work = false;
+                    hpx::lcos::local::spinlock::yield(k);
+                    ++k;
+                    continue;
+                    */
+                }
+
+                boost::shared_ptr<sender_parcel_buffer_type> buffer =
+                    encode_parcels(parcels, *this, archive_flags_, this->enable_security());
+
+                enqueue_out_buffers(locality, buffer, std::move(handlers));
+
+                // Ok, trigger writes ...
+                trigger_writes(locality);
+
+                parcels.clear();
+                handlers.fv_.clear();
+            }
+            //trigger_writes();
+        }
+
+
+        bool dequeue_parcels(pending_parcels_map::iterator it,
             std::vector<parcel>& parcels,
-            std::vector<write_handler_type>& handlers)
+            detail::call_for_each& handlers)
         {
             typedef pending_parcels_map::iterator iterator;
 
             if (!enable_parcel_handling_)
                 return false;
 
+
+            if(it == pending_parcels_.end())
             {
-                lcos::local::spinlock::scoped_lock l(mtx_);
-
-                iterator it = pending_parcels_.find(locality_id);
-
-                // do nothing if parcels have already been picked up by
-                // another thread
-                if (it != pending_parcels_.end() && !it->second.first.empty())
-                {
-                    HPX_ASSERT(it->first == locality_id);
-                    HPX_ASSERT(handlers.size() == parcels.size());
-                    std::swap(parcels, it->second.first);
-                    std::swap(handlers, it->second.second);
-
-                    HPX_ASSERT(!handlers.empty());
-                }
-                else
-                {
-                    HPX_ASSERT(it->second.second.empty());
-                    return false;
-                }
-
-                parcel_destinations_.erase(locality_id);
-
-                return true;
-            }
-        }
-
-        ///////////////////////////////////////////////////////////////////////
-        bool trigger_sending_parcels(naming::locality const& loc,
-            bool background = false)
-        {
-            if (!enable_parcel_handling_)
-                return true;         // do not schedule sending parcels
-
-            error_code ec(lightweight);
-            hpx::applier::register_thread_nullary(
-                util::bind(
-                    &parcelport_impl::get_connection_and_send_parcels,
-                    this, loc, background),
-                "get_connection_and_send_parcels",
-                threads::pending, true, threads::thread_priority_boost,
-                std::size_t(-1), threads::thread_stacksize_default, ec);
-            return ec ? false : true;
-        }
-
-        bool trigger_pending_work()
-        {
-            if(hpx::is_stopped()) return true;
-
-            std::vector<naming::locality> destinations;
-            destinations.reserve(parcel_destinations_.size());
-
-            {
-                lcos::local::spinlock::scoped_lock l(mtx_);
-                if (parcel_destinations_.empty())
-                    return true;
-
-                destinations.reserve(parcel_destinations_.size());
-                BOOST_FOREACH(naming::locality const& loc, parcel_destinations_)
-                {
-                    destinations.push_back(loc);
-                }
+                return false;
             }
 
-            // Create new HPX threads which send the parcels that are still
-            // pending.
-            BOOST_FOREACH(naming::locality const& loc, destinations)
+            naming::locality locality_id = it->first;
+            // do nothing if parcels have already been picked up by
+            // another thread
+            if (!it->second.first.empty())
             {
-                if (!trigger_sending_parcels(loc, true))
-                    return false;
+                HPX_ASSERT(handlers.fv_.size() == parcels.size());
+                std::swap(parcels, it->second.first);
+                std::swap(handlers, it->second.second);
+
+                HPX_ASSERT(!handlers.fv_.empty());
+            }
+            else
+            {
+                HPX_ASSERT(it->second.second.fv_.empty());
+                return false;
             }
 
             return true;
         }
 
-        ///////////////////////////////////////////////////////////////////////
-        void get_connection_and_send_parcels(
-            naming::locality const& locality_id, bool background = false)
-        {
-            // repeat until no more parcels are to be sent
-            while (!hpx::is_stopped())
-            {
-                std::vector<parcel> parcels;
-                std::vector<write_handler_type> handlers;
-
-                if (!dequeue_parcels(locality_id, parcels, handlers))
-                    break;
-
-                HPX_ASSERT(!parcels.empty() && !handlers.empty());
-                HPX_ASSERT(parcels.size() == handlers.size());
-
-                // If none of the parcels may require id-splitting we're safe to
-                // force a new connection from the connection cache.
-                bool force_connection = true;
-                BOOST_FOREACH(parcel const& p, parcels)
-                {
-                    if (p.may_require_id_splitting())
-                    {
-                        force_connection = false;
-                        break;
-                    }
-                }
-
-                error_code ec;
-                boost::shared_ptr<connection> sender_connection =
-                    get_connection(locality_id, force_connection, ec);
-
-                if (!sender_connection)
-                {
-                    if (!force_connection && background)
-                    {
-                        // retry getting a connection, this time enforcing a
-                        // new connection to be created (if needed)
-                        sender_connection = get_connection(locality_id, true, ec);
-                    }
-
-                    if (!sender_connection)
-                    {
-                        // give the parcels back to the queues for later
-                        enqueue_parcels(locality_id, std::move(parcels),
-                            std::move(handlers));
-
-                        // We can safely return if no connection is available
-                        // at this point. As soon as a connection becomes
-                        // available it checks for pending parcels and sends
-                        // those out.
-                        return;
-                    }
-                }
-
-                // send parcels if they didn't get sent by another connection
-                if (!hpx::is_starting() && threads::get_self_ptr() == 0)
-                {
-                    // Re-schedule if this is not executed by an HPX thread
-                    std::size_t thread_num = get_worker_thread_num();
-                    hpx::applier::register_thread_nullary(
-                        hpx::util::bind(
-                            hpx::util::one_shot(&parcelport_impl::send_pending_parcels)
-                          , this
-                          , sender_connection
-                          , std::move(parcels)
-                          , std::move(handlers)
-                        )
-                      , "parcelport_impl::send_pending_parcels"
-                      , threads::pending, true, threads::thread_priority_boost,
-                        thread_num, threads::thread_stacksize_default
-                    );
-                }
-                else
-                {
-                    send_pending_parcels(sender_connection, std::move(parcels),
-                        std::move(handlers));
-                }
-
-                // We yield here for a short amount of time to give another
-                // HPX thread the chance to put a subsequent parcel which
-                // leads to a more effective parcel buffering
-                if (hpx::threads::get_self_ptr())
-                    hpx::this_thread::yield();
-            }
-        }
-
-        void send_pending_parcels_trampoline(
-            boost::system::error_code const& ec,
-            naming::locality const& locality_id,
-            boost::shared_ptr<connection> sender_connection)
+        void send_pending_buffers(
+            boost::system::error_code const & ec
+          , naming::locality const & locality
+          , boost::shared_ptr<connection> sender_connection)
         {
 #if defined(HPX_TRACK_STATE_OF_OUTGOING_TCP_CONNECTION)
             client_connection->set_state(parcelport_connection::state_scheduled_thread);
 #endif
+            HPX_ASSERT(locality == sender_connection->destination());
+            if(ec)
             {
-                lcos::local::spinlock::scoped_lock l(mtx_);
-
-                HPX_ASSERT(locality_id == sender_connection->destination());
-                if (!ec)
-                {
-                    // Give this connection back to the cache as it's not
-                    // needed anymore.
-                    connection_cache_.reclaim(locality_id, sender_connection);
-                }
-                else
-                {
-                    // remove this connection from cache
-                    connection_cache_.clear(locality_id, sender_connection);
-                }
-
-                pending_parcels_map::iterator it = pending_parcels_.find(locality_id);
-                if (it == pending_parcels_.end() || it->second.first.empty())
-                    return;
+                //std::cout << "error?\n";
+                connections_.remove(locality, sender_connection);
+                trigger_writes(locality);
+                return;
             }
 
-            // Create a new HPX thread which sends parcels that are still
-            // pending.
-            trigger_sending_parcels(locality_id);
+            boost::shared_ptr<sender_parcel_buffer_type> buffer;
+            detail::call_for_each handlers;
+
+            if(dequeue_out_buffers(locality, buffer, handlers))
+            {
+                bool success =
+                    sender_connection->write(
+                        buffer
+                      , std::move(handlers)
+                      , util::bind(
+                            &parcelport_impl::send_pending_buffers
+                          , this
+                          , util::placeholders::_1, util::placeholders::_2, util::placeholders::_3
+                        )
+                    );
+                if(!success)
+                {
+                    enqueue_out_buffers(locality, buffer, handlers);
+                }
+            }
         }
 
-        void send_pending_parcels(
-            boost::shared_ptr<connection> sender_connection,
-            std::vector<parcel>&& parcels,
-            std::vector<write_handler_type>&& handlers)
+        void trigger_writes()
         {
-            // If we are stopped already, discard the remaining pending parcels
-            if(hpx::is_stopped()) return;
-
-#if defined(HPX_TRACK_STATE_OF_OUTGOING_TCP_CONNECTION)
-            sender_connection->set_state(parcelport_connection::state_send_pending);
-#endif
-
-#if defined(HPX_DEBUG)
-            // verify the connection points to the right destination
-            BOOST_FOREACH(parcel const& p, parcels)
+            pending_parcels_destinations destinations;
             {
-                naming::locality const parcel_locality_id = p.get_destination_locality();
-                HPX_ASSERT(parcel_locality_id == sender_connection->destination());
-                sender_connection->verify(parcel_locality_id);
+                lcos::local::spinlock::scoped_lock l(out_buffer_mtx_);
+                std::swap(destinations, parcel_destinations_);
             }
-#endif
-            // encode the parcels
-            encode_parcels(parcels, *sender_connection,
-                    archive_flags_, this->enable_security());
 
-            // send them asynchronously
-            sender_connection->async_write(
-                hpx::parcelset::detail::call_for_each(std::move(handlers), parcels[0]),
-                boost::bind(&parcelport_impl::send_pending_parcels_trampoline,
-                    this,
-                    ::_1, ::_2, ::_3));
+            BOOST_FOREACH(naming::locality const & loc, destinations)
+            {
+                trigger_writes(loc);
+            }
+        }
 
-            do_background_work_impl<ConnectionHandler>();
+        void trigger_writes(naming::locality const & locality)
+        {
+            connections_.trigger_writes(
+                locality
+              , connection_handler()
+              , util::bind(
+                    &parcelport_impl::send_pending_buffers
+                  , this
+                  , util::placeholders::_1, util::placeholders::_2, util::placeholders::_3
+                )
+            );
         }
 
     protected:
@@ -724,9 +920,28 @@ namespace hpx { namespace parcelset
         util::io_service_pool io_service_pool_;
 
         /// The connection cache for sending connections
-        util::connection_cache<connection, naming::locality> connection_cache_;
+        //util::connection_cache<connection, naming::locality> connection_cache_;
+        connections<connection> connections_;
 
         int archive_flags_;
+        memory_pool memory_pool_;
+        hpx::lcos::local::spinlock encode_threads_mtx_;
+        std::vector<threads::thread_id_type> encode_threads_;
+        std::size_t num_encode_threads_;
+
+        hpx::lcos::local::spinlock out_buffer_mtx_;
+        typedef
+            std::vector<
+                std::pair<
+                    boost::shared_ptr<sender_parcel_buffer_type>
+                  , detail::call_for_each
+                >
+            >
+            out_buffer_type;
+        typedef
+            std::map<naming::locality, out_buffer_type>
+            out_buffer_map_type;
+        out_buffer_map_type out_buffer_map_;
     };
 }}
 

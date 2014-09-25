@@ -157,7 +157,10 @@ namespace hpx { namespace parcelset { namespace policies { namespace mpi
         boost::shared_ptr<sender> const& sender_connection)
     {
         hpx::lcos::local::spinlock::scoped_lock l(senders_mtx_);
-        senders_.push_back(sender_connection);
+        if(std::find(senders_.begin(), senders_.end(), sender_connection) == senders_.end())
+        {
+            senders_.push_back(sender_connection);
+        }
     }
 
     void add_sender(connection_handler & handler,
@@ -181,9 +184,9 @@ namespace hpx { namespace parcelset { namespace policies { namespace mpi
 
     int connection_handler::get_next_tag()
     {
+        hpx::lcos::local::spinlock::scoped_lock l(tag_mtx_);
         int tag = 0;
         {
-            hpx::lcos::local::spinlock::scoped_lock l(tag_mtx_);
             if(!free_tags_.empty())
             {
                 tag = free_tags_.front();
@@ -239,24 +242,24 @@ namespace hpx { namespace parcelset { namespace policies { namespace mpi
             if(!enable_parcel_handling_) break;
 
             // handle all send requests
+            senders_type senders;
             {
                 hpx::lcos::local::spinlock::scoped_lock l(senders_mtx_);
-                for(
-                    senders_type::iterator it = senders_.begin();
-                    !stopped_ && enable_parcel_handling_ && it != senders_.end();
-                    /**/)
-                {
-                    if((*it)->done())
-                    {
-                        it = senders_.erase(it);
-                    }
-                    else
-                    {
-                        ++it;
-                    }
-                }
-                has_work = !senders_.empty();
+                std::swap(senders, senders_);
             }
+            for(
+                senders_type::iterator it = senders.begin();
+                !stopped_ && enable_parcel_handling_ && it != senders.end();
+                /**/)
+            {
+                if(!(*it)->done())
+                {
+                    hpx::lcos::local::spinlock::scoped_lock l(senders_mtx_);
+                    senders_.push_back(*it);
+                    ++it;
+                }
+            }
+            has_work = !senders_.empty();
 
             // Send the pending close requests
             {

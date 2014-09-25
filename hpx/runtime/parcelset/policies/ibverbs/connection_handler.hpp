@@ -30,6 +30,7 @@ namespace hpx { namespace parcelset {
         typedef boost::mpl::false_  send_early_parcel;
         typedef boost::mpl::true_ do_background_work;
         typedef boost::mpl::false_ do_enable_parcel_handling;
+        typedef boost::mpl::false_ provides_get_buffer;
 
         static const char * name()
         {

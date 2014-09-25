@@ -222,7 +222,12 @@ namespace hpx { namespace parcelset
             "zero_copy_optimization = ${HPX_PARCEL_ZERO_COPY_OPTIMIZATION:"
                 "$[hpx.parcel.array_optimization]}",
             "enable_security = ${HPX_PARCEL_ENABLE_SECURITY:0}",
-            "async_serialization = ${HPX_PARCEL_ASYNC_SERIALIZATION:1}"
+            "async_serialization = ${HPX_PARCEL_ASYNC_SERIALIZATION:1}",
+            "num_encode_threads = ${HPX_NUM_ENCODE_THREADS:4}",
+            "memory_chunk_size = ${HPX_PARCEL_MEMORY_CHUNK_SIZE:"
+                "2048}",//BOOST_PP_STRINGIZE(HPX_PARCELPORT_MEMORY_CHUNK_SIZE) "}",
+            "max_memory_chunks = ${HPX_PARCEL_IBVERBS_MAX_MEMORY_CHUNKS:"
+                "512}" //BOOST_PP_STRINGIZE(HPX_PARCELPORT_MAX_MEMORY_CHUNKS) "}",
             ;
 
         for(int i = 0; i < connection_type::connection_last; ++i)
@@ -664,7 +669,7 @@ namespace hpx { namespace parcelset
         if (resolved_locally) {
             // re-wrap the given parcel-sent handler
             using util::placeholders::_1;
-            write_handler_type wrapped_f =
+            parcelport::write_handler_type wrapped_f =
                 util::bind(&detail::parcel_sent_handler, _1, f, p);
 
             // dispatch to the message handler which is associated with the

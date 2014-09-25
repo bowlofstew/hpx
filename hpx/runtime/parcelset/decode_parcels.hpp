@@ -8,6 +8,7 @@
 #define HPX_PARCELSET_DECODE_PARCELS_HPP
 
 #include <hpx/config.hpp>
+#include <hpx/runtime/parcelset/parcel.hpp>
 #include <hpx/util/portable_binary_archive.hpp>
 
 #if defined(HPX_HAVE_SECURITY)
@@ -248,7 +249,7 @@ namespace hpx { namespace parcelset
             static_cast<std::size_t>(
                 static_cast<boost::uint32_t>(buffer->num_chunks_.first));
 
-//        boost::shared_ptr<std::vector<std::vector<char> > > in_chunks(in_chunks_);
+        //boost::shared_ptr<std::vector<std::vector<char> > > in_chunks(in_chunks_);
         boost::shared_ptr<std::vector<util::serialization_chunk> > chunks;
         if (num_zero_copy_chunks != 0) {
             // decode chunk information

@@ -41,20 +41,15 @@ namespace hpx
 
 namespace hpx { namespace parcelset
 {
-    template <typename Connection>
-    boost::shared_ptr<parcel_buffer<typename Connection::buffer_type> >
-    encode_parcels(std::vector<parcel> const &, Connection & connection, int archive_flags_);
-
-    template <typename Connection>
-    boost::shared_ptr<parcel_buffer<typename Connection::buffer_type> >
-    encode_parcels(parcel const &p, Connection & connection, int archive_flags_)
-    {
-        return encode_parcels(std::vector<parcel>(1, p), connection, archive_flags_);
-    }
+    template <typename ConnectionHandler>
+    boost::shared_ptr<typename ConnectionHandler::sender_parcel_buffer_type>
+    encode_parcels(std::vector<parcel> const & pv, ConnectionHandler & connection_handler,
+        int archive_flags_, bool enable_security);
 
 #if defined(HPX_HAVE_SECURITY)
-    template <typename Archive, typename Connection>
-    void serialize_certificate(Archive& archive, Connection & connection,
+    // FIXME: add first message detection ...
+    template <typename Archive>//, typename Connection>
+    void serialize_certificate(Archive& archive/*, Connection & connection*/,
         std::set<boost::uint32_t>& localities, parcel const& p)
     {
         // We send the certificate corresponding to the originating locality
@@ -75,15 +70,15 @@ namespace hpx { namespace parcelset
             localities.find(locality_id) == localities.end())
         {
             // the first message must originate from this locality
-            HPX_ASSERT(!connection.first_message_ || locality_id == this_locality_id);
+            //FIXME: HPX_ASSERT(!connection.first_message_ || locality_id == this_locality_id);
 
             components::security::signed_certificate const& certificate =
                 hpx::get_locality_certificate(locality_id, ec);
 
             if (!ec) {
                 has_certificate = true;
-                if (locality_id == this_locality_id)
-                    connection.first_message_ = false;
+                //FIXME: if (locality_id == this_locality_id)
+                //FIXME:    connection.first_message_ = false;
                 archive << has_certificate << certificate;
 
                 // keep track of all certificates already prepended for this message
@@ -92,7 +87,7 @@ namespace hpx { namespace parcelset
             else {
                 // if the certificate is not available we have to still be on
                 // the 'first' message (it's too early for a certificate)
-                HPX_ASSERT(connection.first_message_);
+                //FIXME: HPX_ASSERT(connection.first_message_);
                 archive << has_certificate;
             }
         }
@@ -131,24 +126,25 @@ namespace hpx { namespace parcelset
     }
 #endif
 
-    template <typename Connection>
-    void
-    encode_parcels(std::vector<parcel> const & pv, Connection & connection,
+    template <typename ConnectionHandler>
+    boost::shared_ptr<typename ConnectionHandler::sender_parcel_buffer_type>
+    encode_parcels(std::vector<parcel> const & pv, ConnectionHandler & connection_handler,
         int archive_flags_, bool enable_security)
     {
-        typedef parcel_buffer<typename Connection::buffer_type> parcel_buffer_type;
+        typedef typename ConnectionHandler::sender_parcel_buffer_type parcel_buffer_type;
 
+        boost::uint32_t dest_locality_id = pv[0].get_destination_locality_id();
 #if defined(HPX_DEBUG)
         // make sure that all parcels go to the same locality
+
         BOOST_FOREACH(parcel const& p, pv)
         {
-            naming::locality const locality_id = p.get_destination_locality();
-            HPX_ASSERT(locality_id == connection.destination());
+            boost::uint32_t const locality_id = p.get_destination_locality_id();
+            HPX_ASSERT(locality_id == dest_locality_id);
         }
 #endif
         // collect argument sizes from parcels
         std::size_t arg_size = 0;
-        boost::uint32_t dest_locality_id = pv[0].get_destination_locality_id();
 
         boost::shared_ptr<parcel_buffer_type> buffer;
 
@@ -161,7 +157,7 @@ namespace hpx { namespace parcelset
                     arg_size += traits::get_type_size(p);
                 }
 
-                buffer = connection.get_buffer(pv[0], arg_size);
+                buffer = connection_handler.get_sender_buffer(pv[0], arg_size);
                 buffer->clear();
 
                 // mark start of serialization
@@ -194,8 +190,9 @@ namespace hpx { namespace parcelset
                     BOOST_FOREACH(parcel const& p, pv)
                     {
 #if defined(HPX_HAVE_SECURITY)
+                        // FIXME: add first_message_ detection ...
                         if (enable_security)
-                            serialize_certificate(archive, connection, localities, p);
+                            //serialize_certificate(archive, connection, localities, p);
 #endif
                         archive << p;
                     }
@@ -206,7 +203,8 @@ namespace hpx { namespace parcelset
 #if defined(HPX_HAVE_SECURITY)
                 // calculate and sign the hash, but only after everything has
                 // been initialized
-                if (enable_security && !connection.first_message_)
+                // FIXME: add first_message_ detection ...
+                if (enable_security)// && !connection.first_message_)
                     create_message_suffix(*buffer, pv[0].get_parcel_id());
 #endif
                 // store the time required for serialization
@@ -218,7 +216,7 @@ namespace hpx { namespace parcelset
                        "caught hpx::exception: "
                     << e.what();
                 hpx::report_error(boost::current_exception());
-                return;
+                return buffer;
             }
             catch (boost::system::system_error const& e) {
                 LPT_(fatal)
@@ -226,14 +224,14 @@ namespace hpx { namespace parcelset
                        "caught boost::system::error: "
                     << e.what();
                 hpx::report_error(boost::current_exception());
-                return;
+                return buffer;
             }
             catch (boost::exception const&) {
                 LPT_(fatal)
                     << "encode_parcels: "
                        "caught boost::exception";
                 hpx::report_error(boost::current_exception());
-                return;
+                return buffer;
             }
             catch (std::exception const& e) {
                 // We have to repackage all exceptions thrown by the
@@ -248,7 +246,7 @@ namespace hpx { namespace parcelset
                     << "encode_parcels: "
                    "caught unknown exception";
             hpx::report_error(boost::current_exception());
-            return;
+            return buffer;
         }
 
         buffer->size_ = buffer->data_.size();
@@ -296,8 +294,7 @@ namespace hpx { namespace parcelset
                 }
             }
         }
-
-        return;
+        return buffer;
     }
 }}
 

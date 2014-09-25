@@ -74,7 +74,9 @@ namespace hpx { namespace parcelset
         message_handler_map;
 
         typedef parcelport::read_handler_type read_handler_type;
-        typedef parcelport::write_handler_type write_handler_type;
+        typedef HPX_STD_FUNCTION<
+            void(boost::system::error_code const&, parcel const&)
+        > write_handler_type;
 
         /// Construct a new \a parcelhandler initializing it from a AGAS client
         /// instance (parameter \a resolver) and the parcelport to be used for
