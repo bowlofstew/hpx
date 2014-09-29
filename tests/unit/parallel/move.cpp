@@ -227,6 +227,7 @@ void test_move_exception_async(ExPolicy const& p, IteratorTag)
     std::iota(boost::begin(c), boost::end(c), std::rand());
 
     bool caught_exception = false;
+    bool returned_from_algorithm = false;
     try {
         hpx::future<base_iterator> f =
             hpx::parallel::move(p,
@@ -235,6 +236,7 @@ void test_move_exception_async(ExPolicy const& p, IteratorTag)
                     [](){ throw std::runtime_error("test"); }),
                 decorated_iterator(boost::end(c)),
                 boost::begin(d));
+        returned_from_algorithm = true;
         f.get();
 
         HPX_TEST(false);
@@ -248,6 +250,7 @@ void test_move_exception_async(ExPolicy const& p, IteratorTag)
     }
 
     HPX_TEST(caught_exception);
+    HPX_TEST(returned_from_algorithm);
 }
 
 template <typename IteratorTag>
@@ -326,6 +329,7 @@ void test_move_bad_alloc_async(ExPolicy const& p, IteratorTag)
     std::iota(boost::begin(c), boost::end(c), std::rand());
 
     bool caught_bad_alloc = false;
+    bool returned_from_algorithm = false;
     try {
         hpx::future<base_iterator> f =
             hpx::parallel::move(p,
@@ -334,7 +338,7 @@ void test_move_bad_alloc_async(ExPolicy const& p, IteratorTag)
                     [](){ throw std::bad_alloc(); }),
                 decorated_iterator(boost::end(c)),
                 boost::begin(d));
-
+        returned_from_algorithm = true;
         f.get();
 
         HPX_TEST(false);
@@ -347,6 +351,7 @@ void test_move_bad_alloc_async(ExPolicy const& p, IteratorTag)
     }
 
     HPX_TEST(caught_bad_alloc);
+    HPX_TEST(returned_from_algorithm);
 }
 
 template <typename IteratorTag>
@@ -377,8 +382,15 @@ void move_bad_alloc_test()
     test_move_bad_alloc<std::input_iterator_tag>();
 }
 
-int hpx_main()
+int hpx_main(boost::program_options::variables_map& vm)
 {
+    unsigned int seed = (unsigned int)std::time(0);
+    if (vm.count("seed"))
+        seed = vm["seed"].as<unsigned int>();
+
+    std::cout << "using seed: " << seed << std::endl;
+    std::srand(seed);
+
     move_test();
     move_exception_test();
     move_bad_alloc_test();
@@ -387,11 +399,22 @@ int hpx_main()
 
 int main(int argc, char* argv[])
 {
+    // add command line option which controls the random number generator seed
+    using namespace boost::program_options;
+    options_description desc_commandline(
+        "Usage: " HPX_APPLICATION_STRING " [options]");
+
+    desc_commandline.add_options()
+        ("seed,s", value<unsigned int>(),
+        "the random number generator seed to use for this run")
+        ;
+    // By default this test should run on all available cores
     std::vector<std::string> cfg;
     cfg.push_back("hpx.os_threads=" +
         boost::lexical_cast<std::string>(hpx::threads::hardware_concurrency()));
 
-    HPX_TEST_EQ_MSG(hpx::init(argc, argv, cfg), 0,
+    // Initialize and run HPX
+    HPX_TEST_EQ_MSG(hpx::init(desc_commandline, argc, argv, cfg), 0,
         "HPX main exited with non-zero status");
 
     return hpx::util::report_errors();
