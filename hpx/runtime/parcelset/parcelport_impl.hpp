@@ -631,57 +631,81 @@ namespace hpx { namespace parcelset
             }
         }
 
-        void schedule_parcel_encoding()
+        bool needs_encode_thread(bool & force)
+        {
+            force = false;
+            if(encode_threads_.size() >= num_encode_threads_)
+            {
+                // The number of active threads exceeds the maximum ...
+                // We need to schedule another encode thread, if all are
+                // suspended. This is a counter measurement to #1217
+                BOOST_FOREACH(threads::thread_id_type & id, encode_threads_)
+                {
+                    if(threads::get_thread_state(id) != threads::suspended)
+                    {
+                        return false;
+                    }
+                }
+
+                // If at least one is suspend, we need to force a new one ...
+                force = true;
+                return true;
+            }
+            return true;
+        }
+
+        void schedule_parcel_encoding(bool force_async = false)
         {
             if(!enable_parcel_handling_) return;
+            bool force = false;
+
+            static boost::atomic<std::size_t> k(0);
 
             // Are we allowed to launch new threads?
-            if(hpx::is_running() && async_serialization())
+            if((hpx::is_running() && async_serialization()) || force_async)
             {
                 lcos::local::spinlock::scoped_lock l(encode_threads_mtx_);
 
                 // Check if we can start another thread
-                if(encode_threads_.size() > num_encode_threads_)
+                if(needs_encode_thread(force))
                 {
-                    // The number of active threads exceeds the maximum ...
-                    // We need to schedule another encode thread, if all are
-                    // suspended. This is a counter measurement to #1217
-                    std::size_t num_suspended = 0;
-                    BOOST_FOREACH(threads::thread_id_type & id, encode_threads_)
+                    error_code ec(lightweight);
+                    std::size_t thread_num = get_worker_thread_num();
+                    // register thread in suspended mode ...
+                    threads::thread_id_type encode_thread = applier::register_thread_nullary(
+                        util::bind(
+                            &parcelport_impl::encode_parcels_impl
+                          , this
+                          , force
+                        )
+                      , "encode_parcels"
+                      , threads::suspended
+                      , true
+                      , threads::thread_priority_boost
+                      , thread_num
+                      , threads::thread_stacksize_default
+                      , ec
+                    );
+                    if(ec)
                     {
-                        if(threads::get_thread_state(id) == threads::suspended)
-                            ++num_suspended;
+                        // FIXME: throw exception on error ...
                     }
-
-                    // If at least one is running, we don't need to schedule
-                    // a new one.
-                    if(num_suspended < encode_threads_.size())
-                        return;
+                    else
+                    {
+                        // push it back to our list ...
+                        encode_threads_.push_back(encode_thread);
+                        // and set the thread state to pending
+                        threads::set_thread_state(
+                            encode_thread
+                          , threads::pending
+                        );
+                        //hpx::this_thread::yield();
+                    }
                 }
 
-                error_code ec(lightweight);
-                std::size_t thread_num = get_worker_thread_num();
-                threads::thread_id_type encode_thread = applier::register_thread_nullary(
-                    util::bind(
-                        &parcelport_impl::encode_parcels_impl
-                      , this
-                    )
-                  , "encode_parcels"
-                  , threads::pending
-                  , true
-                  , threads::thread_priority_boost
-                  , thread_num
-                  , threads::thread_stacksize_default
-                  , ec
-                );
-                if(ec)
-                {
-                    // FIXME: throw exception on error ...
-                }
-                else
-                {
-                    encode_threads_.push_back(encode_thread);
-                }
+                l.unlock();
+                hpx::lcos::local::spinlock::yield(k);
+                ++k;
 
                 return;
             }
@@ -689,10 +713,15 @@ namespace hpx { namespace parcelset
             if(threads::get_self_ptr() != 0)
             {
                 lcos::local::spinlock::scoped_lock l(encode_threads_mtx_);
+                bool proceed = needs_encode_thread(force);
+                if(!proceed && !force)
+                {
+                    return;
+                }
+
                 encode_threads_.push_back(threads::get_self_id());
             }
-            //std::cout << "non async parcel encoding ...\n";
-            encode_parcels_impl();
+            encode_parcels_impl(true);
         }
 
         struct encoding_parcels
@@ -701,7 +730,6 @@ namespace hpx { namespace parcelset
                 hpx::lcos::local::spinlock & mtx
               , std::vector<threads::thread_id_type> & encode_threads)
               : mtx_(mtx)
-              , thread_id_(threads::get_self_id())
               , encode_threads_(encode_threads)
             {
 #if defined(HPX_DEBUG)
@@ -718,51 +746,30 @@ namespace hpx { namespace parcelset
                 HPX_ASSERT(encode_threads_.size() > 0);
 
                 std::vector<threads::thread_id_type>::iterator it;
-                it = std::find(encode_threads_.begin(), encode_threads_.end(), thread_id_);
+                it = std::find(encode_threads_.begin(), encode_threads_.end(), threads::get_self_id());
                 HPX_ASSERT(it != encode_threads_.end());
                 encode_threads_.erase(it);
             }
 
             hpx::lcos::local::spinlock & mtx_;
-            threads::thread_id_type thread_id_;
             std::vector<threads::thread_id_type> & encode_threads_;
         };
 
-        void encode_parcels_impl()
+        void encode_parcels_impl(bool force)
         {
             // reschedule ourself as HPX thread if we are not already running in
             // a HPX thread
             if(threads::get_self_ptr() == 0 && !hpx::is_starting())
             {
-                error_code ec(lightweight);
-                threads::thread_id_type encode_thread = applier::register_thread_nullary(
-                    util::bind(
-                        &parcelport_impl::encode_parcels_impl
-                      , this
-                    )
-                  , "encode_parcels"
-                  , threads::pending
-                  , true
-                  , threads::thread_priority_boost
-                  , std::size_t(-1)
-                  , threads::thread_stacksize_default
-                  , ec
-                );
-                if(ec)
-                {
-                    // FIXME: throw exception on error ...
-                }
-                else
-                {
-                    lcos::local::spinlock::scoped_lock l(encode_threads_mtx_);
-                    encode_threads_.push_back(encode_thread);
-                }
+                schedule_parcel_encoding(true);
                 return;
             }
 
             encoding_parcels ep(
                 encode_threads_mtx_
               , encode_threads_);
+
+            //if(force) std::cout << "forced ...\n";
 
             naming::locality locality;
             std::vector<parcel> parcels;
@@ -779,7 +786,18 @@ namespace hpx { namespace parcelset
                     while(it != pending_parcels_.end())
                     {
                         locality = it->first;
-                        if(dequeue_parcels(it, parcels, handlers))
+                        while(dequeue_parcels(it, parcels, handlers))
+                        {
+                            if(threads::get_self_ptr() == 0) break;
+                            else
+                            {
+                                hpx::lcos::local::spinlock::yield(k);
+
+                                //hpx::this_thread::yield();
+                                ++k;
+                            }
+                        }
+                        if(!parcels.empty())
                         {
                             has_work = true;
                             t.restart();
@@ -790,13 +808,13 @@ namespace hpx { namespace parcelset
                 }
                 if(parcels.empty())
                 {
-                    break;
-                    /*
+                    if(threads::get_self_ptr() == 0 || force) return;
                     has_work = false;
                     hpx::lcos::local::spinlock::yield(k);
+
+                    //hpx::this_thread::yield();
                     ++k;
                     continue;
-                    */
                 }
 
                 boost::shared_ptr<sender_parcel_buffer_type> buffer =
@@ -835,8 +853,21 @@ namespace hpx { namespace parcelset
             if (!it->second.first.empty())
             {
                 HPX_ASSERT(handlers.fv_.size() == parcels.size());
-                std::swap(parcels, it->second.first);
-                std::swap(handlers, it->second.second);
+                if(parcels.empty())
+                {
+                    HPX_ASSERT(handlers.fv_.empty());
+                    std::swap(parcels, it->second.first);
+                    std::swap(handlers, it->second.second);
+                }
+                else
+                {
+                    std::move(it->second.first.begin(), it->second.first.end(),
+                        std::back_inserter(parcels));
+                    it->second.first.clear();
+                    std::move(it->second.second.fv_.begin(), it->second.second.fv_.end(),
+                        std::back_inserter(handlers.fv_));
+                    it->second.second.fv_.clear();
+                }
 
                 HPX_ASSERT(!handlers.fv_.empty());
             }

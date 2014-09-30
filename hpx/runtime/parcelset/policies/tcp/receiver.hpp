@@ -40,14 +40,15 @@ namespace hpx { namespace parcelset { namespace policies { namespace tcp
     class connection_handler;
 
     class receiver
-      : public parcelport_connection<receiver, std::vector<char>, std::vector<char> >
+      : public parcelport_connection<receiver, connection_handler>
     {
+        typedef parcelport_connection<receiver, connection_handler> base_type;
     public:
         receiver(boost::asio::io_service& io_service, connection_handler& parcelport)
-          : socket_(io_service)
+          : base_type(parcelport)
+          , socket_(io_service)
           , max_inbound_size_(hpx::parcelset::get_max_inbound_size(parcelport))
           , ack_(0)
-          , parcelport_(parcelport)
         {}
 
         ~receiver()
@@ -68,7 +69,7 @@ namespace hpx { namespace parcelset { namespace policies { namespace tcp
         template <typename Handler>
         void async_read(Handler handler)
         {
-            buffer_ = get_buffer();
+            buffer_ = parcelport_.get_receiver_buffer();
             buffer_->clear();
 
             // Store the time of the begin of the read operation
@@ -287,9 +288,6 @@ namespace hpx { namespace parcelset { namespace policies { namespace tcp
         boost::uint64_t max_inbound_size_;
 
         bool ack_;
-
-        /// The handler used to process the incoming request.
-        connection_handler& parcelport_;
 
         /// Counters and timers for parcels received.
         util::high_resolution_timer timer_;

@@ -36,16 +36,18 @@
 namespace hpx { namespace parcelset { namespace policies { namespace tcp
 {
     class sender
-      : public parcelset::parcelport_connection<sender, std::vector<char> >
+      : public parcelset::parcelport_connection<sender, connection_handler>
     {
+        typedef parcelport_connection<sender, connection_handler> base_type;
     public:
         /// Construct a sending parcelport_connection with the given io_service.
         sender(boost::asio::io_service& io_service,
-            naming::locality const& locality_id,
+            naming::locality const& locality_id, connection_handler& parcelport,
             performance_counters::parcels::gatherer& parcels_sent)
-          : socket_(io_service)
+          : base_type(parcelport, locality_id)
+          , socket_(io_service)
           , ack_(0)
-          , there_(locality_id), parcels_sent_(parcels_sent)
+          , parcels_sent_(parcels_sent)
         {
         }
 
@@ -201,9 +203,6 @@ namespace hpx { namespace parcelset { namespace policies { namespace tcp
         boost::asio::ip::tcp::socket socket_;
 
         bool ack_;
-
-        /// the other (receiving) end of this connection
-        naming::locality there_;
 
         /// Counters and their data containers.
         util::high_resolution_timer timer_;

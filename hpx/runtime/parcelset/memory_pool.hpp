@@ -39,6 +39,19 @@ namespace hpx { namespace parcelset {
             }
         }
 
+        std::pair<char *, size_type> get_chunk_address(char * p, size_type size)
+        {
+            if(size > chunk_size_)
+                return std::make_pair(p, size);
+
+            BOOST_FOREACH(memory_chunk & chunk, memory_chunks_)
+            {
+                if(chunk.contains(p))
+                    return std::make_pair(chunk.data_.get(), chunk_size_);
+            }
+            return std::make_pair(p, size);
+        }
+
         char *allocate(size_type size)
         {
             char * result = 0;
